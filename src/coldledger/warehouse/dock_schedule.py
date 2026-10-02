@@ -1,7 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from datetime import datetime, timedelta
+
+from ..core import clock
+from ..sla.site import Site, require_zone, fit_open_window
 
 @dataclass(frozen=True)
 class DockJob:
@@ -35,29 +37,33 @@ class Assignment:
     end: datetime
 
 
-def _utc(v: datetime) -> datetime:
-    if v.tzinfo is None:
-        raise ValueError("timezone-aware datetime required")
-    return v.astimezone(timezone.utc)
 
-
-def build(items: Iterable[DockJob], resources: Iterable[Dock]) -> list[Assignment]:
+def build(items, resources, *, site: Site | None = None) -> list[Assignment]:
     jobs = list(items)
     rs = list(resources)
-    free = {r.key: _utc(r.available_from) for r in rs}
+    free = {r.key: clock.utc(r.available_from) for r in rs}
     previous_group: dict[str, str] = {}
-    by_key = {r.key: r for r in rs}
     result: list[Assignment] = []
-    for job in sorted(jobs, key=lambda j: (-j.priority, _utc(j.latest), _utc(j.earliest), j.key)):
+    for job in sorted(jobs, key=lambda j: (-j.priority, clock.utc(j.latest), clock.utc(j.earliest), j.key)):
         job.validate()
+        if site is not None:
+            require_zone(site, job.zone)
         choices = []
         for r in rs:
             if r.zone != job.zone:
                 continue
+            if site is not None:
+                require_zone(site, r.zone)
             setup = timedelta(minutes=r.setup_minutes if previous_group.get(r.key) not in (None, job.setup_group) else 0)
-            start = max(_utc(job.earliest), free[r.key] + setup, _utc(r.available_from))
+            start = max(clock.utc(job.earliest), free[r.key] + setup, clock.utc(r.available_from))
+            hard_end = min(clock.utc(job.latest), clock.utc(r.available_until))
+            if site is not None:
+                fitted = fit_open_window(site, start, job.duration, hard_end)
+                if fitted is None:
+                    continue
+                start = fitted
             end = start + job.duration
-            if end <= min(_utc(job.latest), _utc(r.available_until)):
+            if end <= hard_end:
                 idle = (start - free[r.key]).total_seconds()
                 choices.append((idle, start, r.key, end))
         if not choices:
@@ -86,7 +92,7 @@ def utilization(assignments: Iterable[Assignment], resources: Iterable[Dock]) ->
     rows = list(assignments)
     result = {}
     for r in resources:
-        window = (_utc(r.available_until) - _utc(r.available_from)).total_seconds()
+        window = (clock.utc(r.available_until) - clock.utc(r.available_from)).total_seconds()
         used = sum((a.end - a.start).total_seconds() for a in rows if a.resource_key == r.key)
         result[r.key] = 0.0 if window <= 0 else min(1.0, used / window)
     return result

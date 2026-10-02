@@ -1,7 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from datetime import datetime, timedelta
+
+from ..core import clock
+from ..sla.site import Site, require_zone, fit_open_window
+
 
 @dataclass(frozen=True)
 class CourierJob:
@@ -19,6 +22,7 @@ class CourierJob:
         if self.latest <= self.earliest:
             raise ValueError("invalid scheduling window")
 
+
 @dataclass(frozen=True)
 class Courier:
     key: str
@@ -26,6 +30,7 @@ class Courier:
     available_from: datetime
     available_until: datetime
     setup_minutes: int = 0
+
 
 @dataclass(frozen=True)
 class Assignment:
@@ -35,29 +40,33 @@ class Assignment:
     end: datetime
 
 
-def _utc(v: datetime) -> datetime:
-    if v.tzinfo is None:
-        raise ValueError("timezone-aware datetime required")
-    return v.astimezone(timezone.utc)
-
-
-def build(items: Iterable[CourierJob], resources: Iterable[Courier]) -> list[Assignment]:
+def build(items, resources, *, site: Site | None = None):
     jobs = list(items)
     rs = list(resources)
-    free = {r.key: _utc(r.available_from) for r in rs}
+    free = {r.key: clock.utc(r.available_from) for r in rs}
     previous_group: dict[str, str] = {}
-    by_key = {r.key: r for r in rs}
     result: list[Assignment] = []
-    for job in sorted(jobs, key=lambda j: (-j.priority, _utc(j.latest), _utc(j.earliest), j.key)):
+    for job in sorted(jobs, key=lambda j: (-j.priority, clock.utc(j.latest), clock.utc(j.earliest), j.key)):
         job.validate()
+        if site is not None:
+            require_zone(site, job.zone)
         choices = []
         for r in rs:
             if r.zone != job.zone:
                 continue
+            if site is not None:
+                require_zone(site, r.zone)
             setup = timedelta(minutes=r.setup_minutes if previous_group.get(r.key) not in (None, job.setup_group) else 0)
-            start = max(_utc(job.earliest), free[r.key] + setup, _utc(r.available_from))
+            start = max(clock.utc(job.earliest), free[r.key] + setup, clock.utc(r.available_from))
             end = start + job.duration
-            if end < min(_utc(job.latest), _utc(r.available_until)):
+            hard_end = min(clock.utc(job.latest), clock.utc(r.available_until))
+            if site is not None:
+                # SLA calendar and dispatch plan share the site open window.
+                fitted = fit_open_window(site, start, job.duration, hard_end)
+                if fitted is None:
+                    continue
+                start, end = fitted, fitted + job.duration
+            if end <= hard_end:
                 idle = (start - free[r.key]).total_seconds()
                 choices.append((idle, start, r.key, end))
         if not choices:
